@@ -38,8 +38,8 @@ def pck(
     prediction: np.ndarray | torch.Tensor,
     target: np.ndarray | torch.Tensor,
     threshold_percent: float,
-    right_shoulder_index: int,
-    left_hip_index: int,
+    right_shoulder_index: int = 5,
+    left_hip_index: int = 12,
 ) -> float:
     prediction, target = _as_numpy(prediction), _as_numpy(target)
     if prediction.ndim == 2:
