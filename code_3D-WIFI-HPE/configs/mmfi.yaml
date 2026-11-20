@@ -1,0 +1,94 @@
+seed: 42
+
+data:
+  root: ./MMFi_Dataset/Dataset
+  protocol: P3
+  split: cross_environment
+  random_seed: 42
+  train_ratio: 0.8
+  window_size: 10
+  num_workers: 4
+  train_environments: [E01, E02, E03]
+  test_environments: [E04]
+  train_subjects:
+    - S01
+    - S02
+    - S03
+    - S04
+    - S05
+    - S06
+    - S07
+    - S08
+    - S11
+    - S12
+    - S13
+    - S14
+    - S15
+    - S16
+    - S17
+    - S18
+    - S21
+    - S22
+    - S23
+    - S24
+    - S25
+    - S26
+    - S27
+    - S28
+    - S31
+    - S32
+    - S33
+    - S34
+    - S35
+    - S36
+    - S37
+    - S38
+  test_subjects:
+    - S09
+    - S10
+    - S19
+    - S20
+    - S29
+    - S30
+    - S39
+    - S40
+  signal:
+    center_frequency_hz: 5000000000.0
+    bandwidth_hz: 40000000.0
+    subcarrier_spacing_hz: 312500.0
+    num_receive_antennas: 3
+    num_subcarriers: 114
+    antenna_spacing_m: null
+    sigma_antenna_m: null
+    sigma_frequency_hz: 6000000.0
+
+model:
+  num_actions: 27
+  num_joints: 17
+  d_model: 64
+  num_heads: 8
+  encoder_layers: 2
+  feedforward_dim: 128
+  action_embedding_dim: 128
+  num_frequency_bands: 3
+  dropout: 0.1
+  dynamic_kernel_size: 5
+  environment_hidden_dim: 128
+  num_environments: 4
+
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  action_loss_weight: 0.5
+  domain_loss_weight: 0.2
+  contrastive_temperature: 0.07
+  lr_step_size: 30
+  lr_gamma: 0.5
+  checkpoint_dir: ./checkpoints
+  save_last: true
+
+metrics:
+  right_shoulder_index: 5
+  left_hip_index: 12
