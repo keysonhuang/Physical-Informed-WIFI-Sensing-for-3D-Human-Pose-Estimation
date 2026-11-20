@@ -3,3 +3,5 @@ scipy>=1.10
 PyYAML>=6.0
 torch>=2.0
 pytest>=7.0
+h5py>=3.8
+PyWavelets>=1.4

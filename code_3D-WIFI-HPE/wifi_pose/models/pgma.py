@@ -41,8 +41,7 @@ class PGMALayer(nn.Module):
         )
         self.norm_feedforward = nn.LayerNorm(d_model)
         prior = physical_prior.clamp(1e-4, 1.0 - 1e-4)
-        prior_logits = torch.log(prior) - torch.log1p(-prior)
-        self.register_buffer("prior_logits", prior_logits)
+        self.register_buffer("prior_logits", torch.log(prior) - torch.log1p(-prior))
         self.register_buffer("band_ids", band_ids.long())
         self.prior_residual = prior_residual
 
@@ -50,13 +49,9 @@ class PGMALayer(nn.Module):
         batch_size, sequence_length, _ = tokens.shape
         qkv = self.qkv(tokens).view(batch_size, sequence_length, 3, self.num_heads, self.head_dim)
         query, key, value = qkv.unbind(dim=2)
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-
+        query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        log_prior = F.logsigmoid(self.prior_logits + self.prior_residual)
-        scores = scores + log_prior.unsqueeze(0).unsqueeze(0)
+        scores = scores + F.logsigmoid(self.prior_logits + self.prior_residual).unsqueeze(0).unsqueeze(0)
 
         band_outputs = []
         for band in range(self.num_bands):
@@ -64,22 +59,20 @@ class PGMALayer(nn.Module):
             query_mask = key_mask.to(dtype=tokens.dtype).view(1, 1, sequence_length, 1)
             band_scores = scores.masked_fill(~key_mask.view(1, 1, 1, sequence_length), -1e4)
             attention = self.attention_dropout(torch.softmax(band_scores, dim=-1))
-            attended = torch.matmul(attention, value)
-            attended = attended * query_mask
-            band_outputs.append(attended)
+            band_outputs.append(torch.matmul(attention, value) * query_mask)
 
         weights = torch.softmax(self.band_weight(tokens.mean(dim=1)), dim=-1)
         mixed = torch.zeros_like(band_outputs[0])
         for band, output in enumerate(band_outputs):
             mixed = mixed + output * weights[:, band].view(batch_size, 1, 1, 1)
-
         mixed = mixed.transpose(1, 2).contiguous().view(batch_size, sequence_length, self.d_model)
         tokens = self.norm_attention(tokens + self.output_dropout(self.output_projection(mixed)))
-        tokens = self.norm_feedforward(tokens + self.feedforward(tokens))
-        return tokens
+        return self.norm_feedforward(tokens + self.feedforward(tokens))
 
 
 class PhysicsGuidedMultipathEncoder(nn.Module):
+    """PGMA encoder for an arbitrary configured number of spatial CSI links."""
+
     def __init__(
         self,
         num_antennas: int = 3,
@@ -88,6 +81,7 @@ class PhysicsGuidedMultipathEncoder(nn.Module):
         subcarrier_spacing_hz: float = 312500.0,
         antenna_spacing_m: float | None = None,
         sigma_antenna_m: float | None = None,
+        channel_positions_m: list | None = None,
         sigma_frequency_hz: float = 6.0e6,
         d_model: int = 64,
         num_heads: int = 8,
@@ -97,8 +91,8 @@ class PhysicsGuidedMultipathEncoder(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        if num_antennas != 3:
-            raise ValueError("The current CSI pair construction expects three receive antennas.")
+        if num_antennas < 1:
+            raise ValueError("num_antennas (spatial CSI channels) must be positive.")
         if num_subcarriers < num_bands:
             raise ValueError("num_subcarriers must be at least num_bands.")
         speed_of_light = 299792458.0
@@ -108,37 +102,50 @@ class PhysicsGuidedMultipathEncoder(nn.Module):
         if sigma_antenna_m is None:
             sigma_antenna_m = max(float(antenna_spacing_m), 1e-4)
 
-        pair_distances = torch.tensor(
-            [antenna_spacing_m, antenna_spacing_m, 2.0 * antenna_spacing_m],
-            dtype=torch.float32,
-        )
+        if channel_positions_m is not None:
+            coordinates = torch.as_tensor(channel_positions_m, dtype=torch.float32)
+            if coordinates.shape[0] != num_antennas:
+                raise ValueError("signal.channel_positions_m must have one position per spatial CSI channel.")
+            if coordinates.ndim == 1:
+                coordinates = coordinates[:, None]
+            if coordinates.ndim != 2 or coordinates.shape[1] not in (1, 2, 3):
+                raise ValueError("channel_positions_m must be [channels] or [channels, 2/3].")
+            channel_coordinate = torch.linalg.vector_norm(coordinates, dim=-1)
+            channel_distances = torch.cdist(coordinates, coordinates)
+        elif num_antennas == 3:
+            # Preserve the MM-Fi three cyclic antenna-pair geometry.
+            channel_coordinate = torch.tensor(
+                [antenna_spacing_m, antenna_spacing_m, 2.0 * antenna_spacing_m], dtype=torch.float32
+            )
+            channel_distances = torch.abs(channel_coordinate[:, None] - channel_coordinate[None, :])
+        else:
+            # Do not invent physical coordinates for distributed links. Frequency coherence
+            # remains active; supply channel_positions_m to enable a spatial coherence prior.
+            channel_coordinate = torch.linspace(0.0, 1.0, num_antennas)
+            channel_distances = torch.zeros((num_antennas, num_antennas), dtype=torch.float32)
+
         subcarrier_offsets = (
             torch.arange(num_subcarriers, dtype=torch.float32) - (num_subcarriers - 1) / 2.0
         ) * subcarrier_spacing_hz
         frequencies = center_frequency_hz + subcarrier_offsets
-        antenna_distances = pair_distances.repeat_interleave(num_subcarriers)
+        channel_positions = channel_coordinate.repeat_interleave(num_subcarriers)
         token_frequencies = frequencies.repeat(num_antennas)
         wavelengths = speed_of_light / token_frequencies
-
-        phase_position = 2.0 * math.pi * antenna_distances / wavelengths
+        phase_position = 2.0 * math.pi * channel_positions / wavelength
         phase_frequency = 2.0 * math.pi * token_frequencies / token_frequencies.max()
         positional_encoding = torch.stack(
-            (
-                torch.sin(phase_position),
-                torch.cos(phase_position),
-                torch.sin(phase_frequency),
-                torch.cos(phase_frequency),
-            ),
-            dim=-1,
+            (torch.sin(phase_position), torch.cos(phase_position),
+             torch.sin(phase_frequency), torch.cos(phase_frequency)), dim=-1
         )
 
-        antenna_difference = antenna_distances[:, None] - antenna_distances[None, :]
+        spatial_distance = channel_distances.repeat_interleave(num_subcarriers, dim=0).repeat_interleave(
+            num_subcarriers, dim=1
+        )
         frequency_difference = token_frequencies[:, None] - token_frequencies[None, :]
         prior = torch.exp(
-            -(antenna_difference.square() / (2.0 * sigma_antenna_m**2))
+            -(spatial_distance.square() / (2.0 * sigma_antenna_m**2))
             -(frequency_difference.square() / (2.0 * sigma_frequency_hz**2))
         )
-
         subcarrier_band_ids = torch.div(
             torch.arange(num_subcarriers) * num_bands,
             num_subcarriers,
@@ -150,23 +157,12 @@ class PhysicsGuidedMultipathEncoder(nn.Module):
         self.position_projection = nn.Linear(4, 2, bias=False)
         self.input_projection = nn.Linear(2, d_model)
         prior = prior.clamp(1e-4, 1.0 - 1e-4)
-        prior_logits = torch.log(prior) - torch.log1p(-prior)
-        shared_prior_residual = nn.Parameter(torch.zeros_like(prior_logits))
-        self.layers = nn.ModuleList(
-            [
-                PGMALayer(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    feedforward_dim=feedforward_dim,
-                    num_bands=num_bands,
-                    physical_prior=prior,
-                    band_ids=band_ids,
-                    prior_residual=shared_prior_residual,
-                    dropout=dropout,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+        shared_prior_residual = nn.Parameter(torch.zeros_like(prior))
+        self.layers = nn.ModuleList([
+            PGMALayer(d_model, num_heads, feedforward_dim, num_bands, prior, band_ids,
+                      shared_prior_residual, dropout)
+            for _ in range(num_layers)
+        ])
         self.register_buffer("positional_encoding", positional_encoding)
 
     def forward(self, dynamic_csi: torch.Tensor) -> torch.Tensor:
@@ -174,8 +170,9 @@ class PhysicsGuidedMultipathEncoder(nn.Module):
             raise ValueError(
                 f"Expected dynamic CSI with shape [batch, {self.num_tokens}, 2], got {tuple(dynamic_csi.shape)}."
             )
-        position = self.position_projection(self.positional_encoding).unsqueeze(0)
-        tokens = self.input_projection(dynamic_csi + position)
+        tokens = self.input_projection(
+            dynamic_csi + self.position_projection(self.positional_encoding).unsqueeze(0)
+        )
         for layer in self.layers:
             tokens = layer(tokens)
         return tokens
