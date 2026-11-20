@@ -27,7 +27,7 @@ def supervised_cross_environment_loss(
     non_self = ~torch.eye(batch_size, dtype=torch.bool, device=features.device)
     positive = (
         actions.view(-1, 1).eq(actions.view(1, -1))
-        & environments.view(-1, 1).ne(environmens.view(1, -1))
+        & environments.view(-1, 1).ne(environments.view(1, -1))
         & non_self
     )
     valid = positive.any(dim=1)
